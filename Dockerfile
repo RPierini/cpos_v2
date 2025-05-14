@@ -6,10 +6,10 @@ WORKDIR /cpos
 
 VOLUME ["/cpos"]
 
+RUN apt-get update && apt-get install -y default-mysql-server
+
 COPY . /cpos
 
-# RUN chown -R root "/cpos"
-
-RUN apt-get update && apt-get install -y default-mysql-server && poetry install
+RUN poetry install
 
 EXPOSE 3306

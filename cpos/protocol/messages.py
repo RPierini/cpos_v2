@@ -14,6 +14,8 @@ class MessageCode:
     PEER_LIST_REQUEST = 0x3
     PEER_LIST = 0x4
     PEER_FORGET_REQUEST = 0x5
+    BLOCK_OFFER = 0x6  # Novo código para oferta de bloco
+    BLOCK_REQUEST = 0x7 # Novo código para requisição de bloco
 
 class MessageParseError(Exception):
     pass
@@ -84,3 +86,27 @@ class ResyncRequest(Message):
 class ResyncResponse(Message):
     def __init__(self, block_received: Block):
         self.block_received = block_received
+
+class BlockOffer(Message):
+    def __init__(self, block_hash: bytes, peer_id: bytes):
+        self.code = MessageCode.BLOCK_OFFER
+        self.block_hash = block_hash
+        self.peer_id = peer_id # Adicionar peer_id para saber quem ofereceu o bloco
+
+    def __str__(self):
+        return f"BlockOffer(hash={self.block_hash.hex()[0:8]}, peer_id={self.peer_id.hex()[0:8]})"
+
+    def __repr__(self):
+        return self.__str__()
+
+class BlockRequest(Message):
+    def __init__(self, block_hash: bytes, peer_id: bytes):
+        self.code = MessageCode.BLOCK_REQUEST
+        self.block_hash = block_hash
+        self.peer_id = peer_id # Adicionar peer_id para saber quem requisitou o bloco
+
+    def __str__(self):
+        return f"BlockRequest(hash={self.block_hash.hex()[0:8]}, peer_id={self.peer_id.hex()[0:8]})"
+
+    def __repr__(self):
+        return self.__str__()

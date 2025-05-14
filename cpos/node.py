@@ -4,7 +4,8 @@ import logging
 import random
 import os
 import pickle
-import random 
+import random
+import time
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cpos.core.block import Block, GenesisBlock
@@ -12,7 +13,7 @@ from cpos.core.blockchain import BlockChain, BlockChainParameters
 from cpos.core.transactions import TransactionList, MockTransactionList
 from cpos.p2p.network import Network
 
-from cpos.protocol.messages import BlockBroadcast, Hello, Message, ResyncRequest, ResyncResponse, PeerForgetRequest
+from cpos.protocol.messages import BlockBroadcast, Hello, Message, ResyncRequest, ResyncResponse, PeerForgetRequest, BlockOffer, BlockRequest
 
 from cpos.p2p.peer import Peer
 
@@ -66,7 +67,7 @@ class Node:
         logger = logging.getLogger(__name__ + self.id.hex())
         handler = logging.StreamHandler()
         formatter = logging.Formatter(f"[%(asctime)s][%(levelname)s] {__name__}: [{self.id.hex()[0:8]}] %(message)s")
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG)
         handler.setFormatter(formatter)
         logger.addHandler(handler)
         self.logger = logger
@@ -95,6 +96,21 @@ class Node:
         self.state = State.LISTENING
         self.missed_blocks: list[tuple[Block, bytes]] = []
         self.received_resync_blocks: list[Block] = []
+
+        # Lista de blocos recebidos na rodada atual para responder a BlockRequests.
+        self.received_blocks_this_round: dict[bytes, Block] = {}
+        
+        # Lista de blocos solicitados
+        self.requested_blocks_hashes: set[bytes] = set()
+
+        # Dicionário para armazenar {block_hash: (peer_id que solicitamos, timestamp da solicitação)}
+        self.pending_block_requests: dict[bytes, tuple[bytes, float]] = {}
+
+        # Dicionário para armazenar {block_hash: [(peer_id que ofereceu, timestamp da oferta), ...]}
+        self.block_offers_received: dict[bytes, list[tuple[bytes, float]]] = {}
+
+        # Parâmetro de configuração para o timeout da requisição de bloco (em segundos)
+        self.block_request_timeout = float(os.environ.get("BLOCK_REQUEST_TIMEOUT", 2.0)) # Valor padrão de 2 segundos
         
         self.message_count = 0
         self.total_message_bytes = 0
@@ -206,18 +222,37 @@ class Node:
             return False
         self.logger.info(f"trying to insert {block}")
         self.received_blocks += 1
+
+        # Verificamos se é um bloco novo        
         block_in_blockchain = self.bc.block_in_blockchain(block)
         block_in_missed_blocks = any(tup[0].hash.hex() == block.hash.hex() for tup in self.missed_blocks)
+
         if not (block_in_blockchain or block_in_missed_blocks):
             own_id = self.id if not None else self.config.id
+
+            self.received_blocks_this_round[block.hash] = block
+            self.logger.debug(f"Added block {block.hash.hex()[0:8]} to received_blocks_this_round.")
+
+            # Se o hash deste bloco estiver na nossa lista de blocos solicitados, removê-lo
+            if block.hash in self.requested_blocks_hashes:
+                self.logger.debug(f"Received requested block {block.hash.hex()[0:8]}, removing from requested_blocks_hashes.")
+                self.requested_blocks_hashes.remove(block.hash)
+
             if self.broadcast_received_block:
-                self.broadcast_message(BlockBroadcast(block, own_id), [peer_id, block.owner_pubkey])
+                #self.broadcast_message(BlockBroadcast(block, own_id), [peer_id, block.owner_pubkey])
+                offer_msg = BlockOffer(block.hash, own_id)
+                self.broadcast_message(offer_msg, [peer_id, block.owner_pubkey])
+                self.logger.info(f"Broadcasting BlockOffer for block {block.hash.hex()[0:8]}")
                 # TODO: Blocks are retransmitted and stored without even checking if they are valid. This is ok in a simulation, but unsafe for real use.
+
             if not self.bc.insert(block):
-                if not block_in_blockchain:
+                if not self.bc.block_in_blockchain(block):
                     # TODO: missed_blocks grows infinetly for every block received from a peer. After a suficient number of rounds, it will grow too big.
-                    # It would be reosonable to have a limit to its size and start deleting old blocks, and maybe store peer_id and block seperatelly and without repetition
+                    # It would be reasonable to have a limit to its size and start deleting old blocks, and maybe store peer_id and block seperatelly and without repetition
                     self.missed_blocks.append((block, peer_id))
+
+        else:
+            self.logger.debug(f"Block {block.hash.hex()[0:8]} already known, ignoring handle_new_block processing.")
 
     def control_number_of_peers(self):
         if len(self.network.known_peers) < self.minimum_num_peers: 
@@ -274,6 +309,10 @@ class Node:
                 # don't log every single round...)
                 self.dump_data("demo/logs")
                 round = self.bc.current_round
+
+                self.logger.info(f"New round {round} started. Clearing received_blocks_this_round.")
+                self.received_blocks_this_round.clear()
+
                 new_block = self.generate_block()
                 if new_block is not None and self.broadcast_created_block: # if dishonest node isnt going to broadcast block, it is also not going to insert in local blockchain
                     self.produced_blocks += 1
@@ -294,8 +333,117 @@ class Node:
             self.logger.debug(f"new message: {msg}")
 
             if self.state == State.LISTENING:
+                # Verificar timeouts de requisição de bloco
+                current_time = time.time()
+                hashes_to_re_request = []
+                for block_hash, (requested_peer_id, request_timestamp) in list(self.pending_block_requests.items()): # Usar list() para iterar sobre uma cópia, permitindo modificação do dicionário
+                    if current_time - request_timestamp > self.block_request_timeout:
+                        self.logger.warning(f"BlockRequest for {block_hash.hex()[0:8]} to {requested_peer_id.hex()[0:8]} timed out.")
+                        hashes_to_re_request.append(block_hash)
+
+                for block_hash in hashes_to_re_request:
+                    # Remover a requisição timed out
+                    requested_peer_id, _ = self.pending_block_requests.pop(block_hash)
+                    self.requested_blocks_hashes.discard(block_hash) # Remover também do set auxiliar
+
+                    # Tentar encontrar um peer alternativo que ofereceu este bloco
+                    if block_hash in self.block_offers_received:
+                        fallback_peer_id = None
+                        # Buscar o próximo peer na lista de ofertas que não seja o peer original que falhou
+                        fallback_offers = [(pid, ts) for pid, ts in self.block_offers_received[block_hash] if pid != requested_peer_id]
+
+                        if fallback_offers:
+                            # Selecionar um peer alternativo (por exemplo, o que enviou a oferta mais antiga entre os fallbacks)
+                            fallback_offers.sort(key=lambda x: x[1]) # Ordenar por timestamp
+                            fallback_peer_id, offer_timestamp = fallback_offers.pop(0) # Pegar o primeiro (mais antigo)
+                            self.logger.info(f"Attempting to re-request block {block_hash.hex()[0:8]} from fallback peer {fallback_peer_id.hex()[0:8]}")
+
+                            # Enviar a nova BlockRequest
+                            request_msg = BlockRequest(block_hash, self.id)
+                            if self.send_message(fallback_peer_id, request_msg):
+                                self.pending_block_requests[block_hash] = (fallback_peer_id, current_time)
+                                self.requested_blocks_hashes.add(block_hash)
+                                self.logger.debug(f"Re-requested block {block_hash.hex()[0:8]} successfully from {fallback_peer_id.hex()[0:8]}.")
+                            else:
+                                self.logger.warning(f"Failed to re-request block {block_hash.hex()[0:8]} from fallback peer {fallback_peer_id.hex()[0:8]}.")
+                                # Se falhar ao enviar para o fallback, manter a oferta restante para este bloco
+                                self.block_offers_received[block_hash] = fallback_offers + [(fallback_peer_id, offer_timestamp)] # Adicionar de volta se falhou
+
+                        if not fallback_offers and block_hash in self.block_offers_received:
+                            # Se não houver mais fallbacks, remover a entrada do dicionário
+                            self.logger.warning(f"No fallback peers available for block {block_hash.hex()[0:8]}.")
+                            del self.block_offers_received[block_hash]
+
+                    elif block_hash in self.block_offers_received:
+                        # Se a entrada existir mas a lista de offers estiver vazia (limpeza anterior), remover
+                        del self.block_offers_received[block_hash]
+
                 if isinstance(msg, BlockBroadcast):
-                    self.handle_new_block(msg.block, msg.peer_id)    
+                    self.logger.debug(f"Received BlockBroadcast for block {msg.block.hash.hex()[0:8]} from peer {msg.peer_id.hex()[0:8]}")
+                    received_block_hash = msg.block.hash
+
+                    # Remover o hash dos dicionários de requisições pendentes e ofertas recebidas
+                    if received_block_hash in self.pending_block_requests:
+                        self.logger.debug(f"Received pending requested block {received_block_hash.hex()[0:8]}, removing from pending requests.")
+                        del self.pending_block_requests[received_block_hash]
+                        self.requested_blocks_hashes.discard(received_block_hash)
+
+                    if received_block_hash in self.block_offers_received:
+                        self.logger.debug(f"Received block {received_block_hash.hex()[0:8]}, removing from received offers list.")
+                        del self.block_offers_received[received_block_hash]
+
+                    self.handle_new_block(msg.block, msg.peer_id)
+
+                if isinstance(msg, BlockOffer):
+                    self.logger.info(f"Received BlockOffer for block {msg.block_hash.hex()[0:8]} from peer {msg.peer_id.hex()[0:8]}")
+
+                    # Coletando informações da oferta
+                    block_hash = msg.block_hash
+                    offering_peer_id = msg.peer_id
+                    current_time = time.time()
+
+                    # Verificar se o bloco já é conhecido
+                    block_known = self.bc.block_in_blockchain_by_hash(msg.block_hash) # Será necessário um novo método no BlockChain para verificar por hash
+                    block_in_missed = any(tup[0].hash == msg.block_hash for tup in self.missed_blocks)
+
+                    if not block_known and not block_in_missed:
+                        # Adicionar a oferta recebida à lista de ofertas pendentes para este hash
+                        if block_hash not in self.block_offers_received:
+                            self.block_offers_received[block_hash] = []
+                        # Evitar adicionar ofertas duplicadas do mesmo peer muito próximas no tempo, se necessário
+                        self.block_offers_received[block_hash].append((offering_peer_id, current_time))
+
+                        # Se ainda não solicitamos este bloco, enviar a primeira requisição
+                        if block_hash not in self.pending_block_requests:
+                            self.logger.info(f"Block {block_hash.hex()[0:8]} not pending request, sending initial BlockRequest to {offering_peer_id.hex()[0:8]}")
+                            request_msg = BlockRequest(block_hash, self.id)
+                            if self.send_message(offering_peer_id, request_msg):
+                                self.pending_block_requests[block_hash] = (offering_peer_id, current_time)
+                                # Adicionar o hash ao set de hashes solicitados também, para rápida verificação
+                                self.requested_blocks_hashes.add(block_hash)
+                            else:
+                                self.logger.warning(f"Failed to send initial BlockRequest for {block_hash.hex()[0:8]} to {offering_peer_id.hex()[0:8]}.")
+                        else:
+                            self.logger.debug(f"Block {block_hash.hex()[0:8]} already pending request, storing offer from {offering_peer_id.hex()[0:8]} as fallback.")
+                    else:
+                        self.logger.debug(f"Block {block_hash.hex()[0:8]} already known, ignoring offer.")
+
+                if isinstance(msg, BlockRequest):
+                    self.logger.info(f"Received BlockRequest for block {msg.block_hash.hex()[0:8]} from peer {msg.peer_id.hex()[0:8]}")
+                    # Tentar obter o bloco solicitado da blockchain local
+                    requested_block_hash = msg.block_hash
+                    requesting_peer_id = msg.peer_id
+
+                    requested_block = self.received_blocks_this_round.get(requested_block_hash)
+
+                    if requested_block:
+                        self.logger.info(f"Found block {requested_block.hash.hex()[0:8]}, sending to {requesting_peer_id.hex()[0:8]}")
+                        # Enviar o bloco solicitado de volta usando BlockBroadcast
+                        response_msg = BlockBroadcast(requested_block, self.id)
+                        self.send_message(requesting_peer_id, response_msg)
+                    else:
+                        self.logger.warning(f"Requested block {requested_block_hash.hex()[0:8]} not found in received_blocks_this_round.")
+
                 if isinstance(msg, ResyncRequest):
                     peer_id = msg.peer_id
                     # make sure we only send stuff after the genesis block

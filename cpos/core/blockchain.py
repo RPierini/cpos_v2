@@ -224,7 +224,7 @@ class BlockChain:
 
         # in case there is already a block present at block.index
         if self.number_of_blocks() > block.index:
-            if block.proof_hash <= self.get_proof_hash_of_block(block.index):
+            if block.proof_hash >= self.get_proof_hash_of_block(block.index):
                 self._log_failed_insertion(block, f"smaller proof_hash")
                 return False
         
@@ -474,3 +474,23 @@ class BlockChain:
         block_info = cursor.fetchone()
         cursor.close()
         return self.compose_block(block_info)
+
+    def block_in_blockchain_by_hash(self, block_hash: bytes) -> bool:
+        cursor = connection.cursor()
+        # Assumindo que o hash do bloco é armazenado na coluna 'hash' e é usado como 'id' no banco de dados
+        FIND_BLOCK_QUERY = "SELECT EXISTS (SELECT 1 FROM localChains WHERE id = %s LIMIT 1)"
+        cursor.execute(FIND_BLOCK_QUERY, [block_hash.hex()])
+        exists = cursor.fetchone()[0]
+        cursor.close()
+        return bool(exists)
+
+    def get_block_by_hash(self, block_hash: bytes) -> Optional[Block]:
+        cursor = connection.cursor()
+        # Assumindo que o hash do bloco é armazenado na coluna 'hash' e é usado como 'id' no banco de dados
+        GET_BLOCK_QUERY = "SELECT * FROM localChains WHERE id = %s LIMIT 1"
+        cursor.execute(GET_BLOCK_QUERY, [block_hash.hex()])
+        block_info = cursor.fetchone()
+        cursor.close()
+        if block_info:
+            return self.compose_block(block_info)
+        return None
