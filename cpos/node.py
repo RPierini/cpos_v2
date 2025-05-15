@@ -313,7 +313,28 @@ class Node:
                 self.logger.info(f"New round {round} started. Clearing received_blocks_this_round.")
                 self.received_blocks_this_round.clear()
 
-                new_block = self.generate_block()
+                if not self.network.known_peers: # Verifica se a lista de peers conhecidos está vazia
+                    self.logger.warning(f"Round {round}: No peers found. Requesting peers from beacon and skipping block generation for this round.")
+
+                    # Solicita peers ao beacon
+                    additional_peerlist = self.network.get_additional_peers_from_beacon()
+                    if additional_peerlist is not None:
+                        self.logger.info(f"Received {len(additional_peerlist)} peers from beacon.")
+                        for peer in additional_peerlist:
+                            if peer.id == self.id or peer.id in self.network.known_peers:
+                                continue
+                            self.logger.info(f"Connecting to new peer from beacon: {peer}")
+                            self.network.connect(peer.ip, peer.port, peer.id)
+                            msg_hello = Hello(self.id, self.config.port)
+                            self.send_message(peer.id, msg_hello)
+                    else:
+                        self.logger.warning("Failed to get additional peers from beacon or beacon returned no peers.")
+                    # Pula a geração de bloco para esta rodada
+                    new_block = None
+                else:
+                    # Se houver peers, prossegue com a geração do bloco normalmente
+                    new_block = self.generate_block()
+                
                 if new_block is not None and self.broadcast_created_block: # if dishonest node isnt going to broadcast block, it is also not going to insert in local blockchain
                     self.produced_blocks += 1
                     self.bc.insert(new_block)
